@@ -4,7 +4,7 @@ import numpy as np
 import json
 import plotly.graph_objects as go
 import plotly.utils
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, Response, render_template, request, jsonify
 from flask_cors import CORS
 import sys
 import warnings
@@ -12,7 +12,14 @@ import datetime
 warnings.filterwarnings('ignore')
 
 # Add project root directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(PROJECT_ROOT)
+
+# Directories scanned for data files: the user data directory and the bundled fine-tuning sample
+DATA_DIRS = [
+    os.path.join(PROJECT_ROOT, 'data'),
+    os.path.join(PROJECT_ROOT, 'finetune_csv', 'data'),
+]
 
 try:
     from model import Kronos, KronosTokenizer, KronosPredictor
@@ -28,6 +35,8 @@ CORS(app)
 tokenizer = None
 model = None
 predictor = None
+current_model_key = None
+current_device = None
 
 # Available model configurations
 AVAILABLE_MODELS = {
@@ -58,22 +67,77 @@ AVAILABLE_MODELS = {
 }
 
 def load_data_files():
-    """Scan data directory and return available data files"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+    """Scan data directories and return available data files"""
     data_files = []
-    
-    if os.path.exists(data_dir):
-        for file in os.listdir(data_dir):
+
+    for data_dir in DATA_DIRS:
+        if not os.path.isdir(data_dir):
+            continue
+        for file in sorted(os.listdir(data_dir)):
             if file.endswith(('.csv', '.feather')):
                 file_path = os.path.join(data_dir, file)
                 file_size = os.path.getsize(file_path)
                 data_files.append({
                     'name': file,
                     'path': file_path,
+                    'source': os.path.relpath(data_dir, PROJECT_ROOT),
                     'size': f"{file_size / 1024:.1f} KB" if file_size < 1024*1024 else f"{file_size / (1024*1024):.1f} MB"
                 })
-    
+
     return data_files
+
+def detect_devices():
+    """Report which compute devices torch can use on this machine"""
+    devices = [{'id': 'cpu', 'label': 'CPU', 'available': True}]
+    try:
+        import torch
+        devices.append({'id': 'cuda', 'label': 'CUDA (NVIDIA GPU)', 'available': bool(torch.cuda.is_available())})
+        mps_backend = getattr(torch.backends, 'mps', None)
+        devices.append({'id': 'mps', 'label': 'MPS (Apple Silicon)', 'available': bool(mps_backend and mps_backend.is_available())})
+    except ImportError:
+        pass
+    return devices
+
+def detect_timeframe(df):
+    """Describe the sampling interval of the data from its first few timestamps"""
+    if len(df) < 2:
+        return "Unknown"
+
+    time_diffs = []
+    for i in range(1, min(10, len(df))):  # Check first 10 time differences
+        diff = df['timestamps'].iloc[i] - df['timestamps'].iloc[i-1]
+        time_diffs.append(diff)
+
+    if not time_diffs:
+        return "Unknown"
+
+    # Calculate average time difference
+    avg_diff = sum(time_diffs, pd.Timedelta(0)) / len(time_diffs)
+
+    # Convert to readable format
+    if avg_diff < pd.Timedelta(minutes=1):
+        return f"{avg_diff.total_seconds():.0f} seconds"
+    elif avg_diff < pd.Timedelta(hours=1):
+        return f"{avg_diff.total_seconds() / 60:.0f} minutes"
+    elif avg_diff < pd.Timedelta(days=1):
+        return f"{avg_diff.total_seconds() / 3600:.0f} hours"
+    else:
+        return f"{avg_diff.days} days"
+
+def bars_to_records(frame):
+    """Convert OHLCV rows to JSON-serializable records"""
+    records = []
+    for _, row in frame.iterrows():
+        records.append({
+            'timestamp': row['timestamps'].isoformat(),
+            'open': float(row['open']),
+            'high': float(row['high']),
+            'low': float(row['low']),
+            'close': float(row['close']),
+            'volume': float(row['volume']) if 'volume' in row else 0,
+            'amount': float(row['amount']) if 'amount' in row else 0
+        })
+    return records
 
 def load_data_file(file_path):
     """Load data file"""
@@ -114,8 +178,8 @@ def load_data_file(file_path):
         if 'amount' in df.columns:
             df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
         
-        # Remove rows containing NaN values
-        df = df.dropna()
+        # Remove rows containing NaN values; keep a positional index so row numbers match iloc
+        df = df.dropna().reset_index(drop=True)
         
         return df, None
         
@@ -332,6 +396,18 @@ def index():
     """Home page"""
     return render_template('index.html')
 
+_plotly_js_cache = None
+
+@app.route('/vendor/plotly.min.js')
+def plotly_js():
+    """Serve plotly.js from the installed plotly package so the UI works without a CDN"""
+    global _plotly_js_cache
+    if _plotly_js_cache is None:
+        from plotly.offline import get_plotlyjs
+        _plotly_js_cache = get_plotlyjs()
+    return Response(_plotly_js_cache, mimetype='application/javascript',
+                    headers={'Cache-Control': 'public, max-age=86400'})
+
 @app.route('/api/data-files')
 def get_data_files():
     """Get available data file list"""
@@ -342,42 +418,21 @@ def get_data_files():
 def load_data():
     """Load data file"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         file_path = data.get('file_path')
-        
+
         if not file_path:
             return jsonify({'error': 'File path cannot be empty'}), 400
-        
+
         df, error = load_data_file(file_path)
         if error:
             return jsonify({'error': error}), 400
-        
-        # Detect data time frequency
-        def detect_timeframe(df):
-            if len(df) < 2:
-                return "Unknown"
-            
-            time_diffs = []
-            for i in range(1, min(10, len(df))):  # Check first 10 time differences
-                diff = df['timestamps'].iloc[i] - df['timestamps'].iloc[i-1]
-                time_diffs.append(diff)
-            
-            if not time_diffs:
-                return "Unknown"
-            
-            # Calculate average time difference
-            avg_diff = sum(time_diffs, pd.Timedelta(0)) / len(time_diffs)
-            
-            # Convert to readable format
-            if avg_diff < pd.Timedelta(minutes=1):
-                return f"{avg_diff.total_seconds():.0f} seconds"
-            elif avg_diff < pd.Timedelta(hours=1):
-                return f"{avg_diff.total_seconds() / 60:.0f} minutes"
-            elif avg_diff < pd.Timedelta(days=1):
-                return f"{avg_diff.total_seconds() / 3600:.0f} hours"
-            else:
-                return f"{avg_diff.days} days"
-        
+        if len(df) == 0:
+            return jsonify({'error': 'File contains no complete OHLC rows'}), 400
+
+        # Downsampled close series for the window overview
+        overview_stride = max(1, len(df) // 1200)
+
         # Return data information
         data_info = {
             'rows': len(df),
@@ -389,15 +444,22 @@ def load_data():
                 'max': float(df[['open', 'high', 'low', 'close']].max().max())
             },
             'prediction_columns': ['open', 'high', 'low', 'close'] + (['volume'] if 'volume' in df.columns else []),
-            'timeframe': detect_timeframe(df)
+            'timeframe': detect_timeframe(df),
+            'has_volume': 'volume' in df.columns,
+            # Row timestamps as seconds since epoch (naive timestamps treated as UTC) for exact window labels
+            'timestamps': (df['timestamps'].astype('int64') // 10**9).tolist(),
+            'overview': {
+                'stride': overview_stride,
+                'close': [float(v) for v in df['close'].iloc[::overview_stride]]
+            }
         }
-        
+
         return jsonify({
             'success': True,
             'data_info': data_info,
             'message': f'Successfully loaded data, total {len(df)} rows'
         })
-        
+
     except Exception as e:
         return jsonify({'error': f'Failed to load data: {str(e)}'}), 500
 
@@ -405,183 +467,103 @@ def load_data():
 def predict():
     """Perform prediction"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         file_path = data.get('file_path')
-        lookback = int(data.get('lookback', 400))
-        pred_len = int(data.get('pred_len', 120))
-        
-        # Get prediction quality parameters
-        temperature = float(data.get('temperature', 1.0))
-        top_p = float(data.get('top_p', 0.9))
-        sample_count = int(data.get('sample_count', 1))
-        
+
+        try:
+            lookback = int(data.get('lookback', 400))
+            pred_len = int(data.get('pred_len', 120))
+            # Get prediction quality parameters
+            temperature = float(data.get('temperature', 1.0))
+            top_p = float(data.get('top_p', 0.9))
+            sample_count = int(data.get('sample_count', 1))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Prediction parameters must be numeric'}), 400
+
         if not file_path:
             return jsonify({'error': 'File path cannot be empty'}), 400
-        
+        if lookback < 1 or pred_len < 1:
+            return jsonify({'error': 'Lookback and prediction length must be at least 1'}), 400
+        if temperature <= 0 or not (0 < top_p <= 1) or sample_count < 1:
+            return jsonify({'error': 'Temperature must be > 0, top_p in (0, 1], sample count >= 1'}), 400
+
+        if not MODEL_AVAILABLE or predictor is None:
+            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
+
         # Load data
         df, error = load_data_file(file_path)
         if error:
             return jsonify({'error': error}), 400
-        
+
         if len(df) < lookback:
             return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
-        
-        # Perform prediction
-        if MODEL_AVAILABLE and predictor is not None:
+
+        # Resolve the window start: explicit row index, else first row at/after start_date, else first row
+        start_index = data.get('start_index')
+        start_date = data.get('start_date')
+        if start_index is not None:
             try:
-                # Use real Kronos model
-                # Only use necessary columns: OHLCV, excluding amount
-                required_cols = ['open', 'high', 'low', 'close']
-                if 'volume' in df.columns:
-                    required_cols.append('volume')
-                
-                # Process time period selection
-                start_date = data.get('start_date')
-                
-                if start_date:
-                    # Custom time period - fix logic: use data within selected window
-                    start_dt = pd.to_datetime(start_date)
-                    
-                    # Find data after start time
-                    mask = df['timestamps'] >= start_dt
-                    time_range_df = df[mask]
-                    
-                    # Ensure sufficient data: lookback + pred_len
-                    if len(time_range_df) < lookback + pred_len:
-                        return jsonify({'error': f'Insufficient data from start time {start_dt.strftime("%Y-%m-%d %H:%M")}, need at least {lookback + pred_len} data points, currently only {len(time_range_df)} available'}), 400
-                    
-                    # Use first lookback data points within selected window for prediction
-                    x_df = time_range_df.iloc[:lookback][required_cols]
-                    x_timestamp = time_range_df.iloc[:lookback]['timestamps']
-                    
-                    # Use last pred_len data points within selected window as actual values
-                    y_timestamp = time_range_df.iloc[lookback:lookback+pred_len]['timestamps']
-                    
-                    # Calculate actual time period length
-                    start_timestamp = time_range_df['timestamps'].iloc[0]
-                    end_timestamp = time_range_df['timestamps'].iloc[lookback+pred_len-1]
-                    time_span = end_timestamp - start_timestamp
-                    
-                    prediction_type = f"Kronos model prediction (within selected window: first {lookback} data points for prediction, last {pred_len} data points for comparison, time span: {time_span})"
-                else:
-                    # Use latest data
-                    x_df = df.iloc[:lookback][required_cols]
-                    x_timestamp = df.iloc[:lookback]['timestamps']
-                    y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
-                    prediction_type = "Kronos model prediction (latest data)"
-                
-                # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
-                if isinstance(x_timestamp, pd.DatetimeIndex):
-                    x_timestamp = pd.Series(x_timestamp, name='timestamps')
-                if isinstance(y_timestamp, pd.DatetimeIndex):
-                    y_timestamp = pd.Series(y_timestamp, name='timestamps')
-                
-                pred_df = predictor.predict(
-                    df=x_df,
-                    x_timestamp=x_timestamp,
-                    y_timestamp=y_timestamp,
-                    pred_len=pred_len,
-                    T=temperature,
-                    top_p=top_p,
-                    sample_count=sample_count
-                )
-                
-            except Exception as e:
-                return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
-        else:
-            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
-        
-        # Prepare actual data for comparison (if exists)
-        actual_data = []
-        actual_df = None
-        
-        if start_date:  # Custom time period
-            # Fix logic: use data within selected window
-            # Prediction uses first 400 data points within selected window
-            # Actual data should be last 120 data points within selected window
+                start = int(start_index)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'start_index must be an integer'}), 400
+            if start < 0:
+                return jsonify({'error': 'start_index must be non-negative'}), 400
+            window_label = f'row {start}'
+        elif start_date:
             start_dt = pd.to_datetime(start_date)
-            
-            # Find data starting from start_date
-            mask = df['timestamps'] >= start_dt
-            time_range_df = df[mask]
-            
-            if len(time_range_df) >= lookback + pred_len:
-                # Get last 120 data points within selected window as actual values
-                actual_df = time_range_df.iloc[lookback:lookback+pred_len]
-                
-                for i, (_, row) in enumerate(actual_df.iterrows()):
-                    actual_data.append({
-                        'timestamp': row['timestamps'].isoformat(),
-                        'open': float(row['open']),
-                        'high': float(row['high']),
-                        'low': float(row['low']),
-                        'close': float(row['close']),
-                        'volume': float(row['volume']) if 'volume' in row else 0,
-                        'amount': float(row['amount']) if 'amount' in row else 0
-                    })
-        else:  # Latest data
-            # Prediction uses first 400 data points
-            # Actual data should be 120 data points after first 400 data points
-            if len(df) >= lookback + pred_len:
-                actual_df = df.iloc[lookback:lookback+pred_len]
-                for i, (_, row) in enumerate(actual_df.iterrows()):
-                    actual_data.append({
-                        'timestamp': row['timestamps'].isoformat(),
-                        'open': float(row['open']),
-                        'high': float(row['high']),
-                        'low': float(row['low']),
-                        'close': float(row['close']),
-                        'volume': float(row['volume']) if 'volume' in row else 0,
-                        'amount': float(row['amount']) if 'amount' in row else 0
-                    })
-        
-        # Create chart - pass historical data start position
-        if start_date:
-            # Custom time period: find starting position of historical data in original df
-            start_dt = pd.to_datetime(start_date)
-            mask = df['timestamps'] >= start_dt
-            historical_start_idx = df[mask].index[0] if len(df[mask]) > 0 else 0
+            positions = np.flatnonzero((df['timestamps'] >= start_dt).to_numpy())
+            start = int(positions[0]) if len(positions) > 0 else len(df)
+            window_label = start_dt.strftime("%Y-%m-%d %H:%M")
         else:
-            # Latest data: start from beginning
-            historical_start_idx = 0
-        
-        chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
-        
-        # Prepare prediction result data - fix timestamp calculation logic
-        if 'timestamps' in df.columns:
-            if start_date:
-                # Custom time period: use selected window data to calculate timestamps
-                start_dt = pd.to_datetime(start_date)
-                mask = df['timestamps'] >= start_dt
-                time_range_df = df[mask]
-                
-                if len(time_range_df) >= lookback:
-                    # Calculate prediction timestamps starting from last time point of selected window
-                    last_timestamp = time_range_df['timestamps'].iloc[lookback-1]
-                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
-                    future_timestamps = pd.date_range(
-                        start=last_timestamp + time_diff,
-                        periods=pred_len,
-                        freq=time_diff
-                    )
-                else:
-                    future_timestamps = []
-            else:
-                # Latest data: calculate from last time point of entire data file
-                last_timestamp = df['timestamps'].iloc[-1]
-                time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
-                future_timestamps = pd.date_range(
-                    start=last_timestamp + time_diff,
-                    periods=pred_len,
-                    freq=time_diff
-                )
-        else:
-            future_timestamps = range(len(df), len(df) + pred_len)
-        
+            start = 0
+            window_label = None
+
+        end = start + lookback + pred_len
+        if end > len(df):
+            available = max(0, len(df) - start)
+            where = f' from {window_label}' if window_label else ''
+            return jsonify({'error': f'Insufficient data{where}, need at least {lookback + pred_len} data points, currently only {available} available'}), 400
+
+        context_df = df.iloc[start:start + lookback]
+        actual_df = df.iloc[start + lookback:end]
+
+        # Only use necessary columns: OHLCV, excluding amount
+        required_cols = ['open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            required_cols.append('volume')
+
+        x_df = context_df[required_cols]
+        # Series (not DatetimeIndex) to avoid .dt attribute errors in the Kronos model
+        x_timestamp = context_df['timestamps'].reset_index(drop=True)
+        y_timestamp = actual_df['timestamps'].reset_index(drop=True)
+
+        time_span = actual_df['timestamps'].iloc[-1] - context_df['timestamps'].iloc[0]
+        prediction_type = (f"Kronos model prediction (window starting at row {start}: first {lookback} data points "
+                           f"for prediction, last {pred_len} data points for comparison, time span: {time_span})")
+
+        try:
+            pred_df = predictor.predict(
+                df=x_df,
+                x_timestamp=x_timestamp,
+                y_timestamp=y_timestamp,
+                pred_len=pred_len,
+                T=temperature,
+                top_p=top_p,
+                sample_count=sample_count
+            )
+        except Exception as e:
+            return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
+
+        historical_data = bars_to_records(context_df)
+        actual_data = bars_to_records(actual_df)
+
+        chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, start)
+
+        # Forecast rows are aligned with the future timestamps passed to the predictor
         prediction_results = []
         for i, (_, row) in enumerate(pred_df.iterrows()):
             prediction_results.append({
-                'timestamp': future_timestamps[i].isoformat() if i < len(future_timestamps) else f"T{i}",
+                'timestamp': y_timestamp.iloc[i].isoformat() if i < len(y_timestamp) else f"T{i}",
                 'open': float(row['open']),
                 'high': float(row['high']),
                 'low': float(row['low']),
@@ -589,76 +571,102 @@ def predict():
                 'volume': float(row['volume']) if 'volume' in row else 0,
                 'amount': float(row['amount']) if 'amount' in row else 0
             })
-        
+
+        prediction_params = {
+            'lookback': lookback,
+            'pred_len': pred_len,
+            'temperature': temperature,
+            'top_p': top_p,
+            'sample_count': sample_count,
+            'start_index': start,
+            'start_date': start_date if start_date else context_df['timestamps'].iloc[0].isoformat()
+        }
+
         # Save prediction results to file
-        try:
-            save_prediction_results(
-                file_path=file_path,
-                prediction_type=prediction_type,
-                prediction_results=prediction_results,
-                actual_data=actual_data,
-                input_data=x_df,
-                prediction_params={
-                    'lookback': lookback,
-                    'pred_len': pred_len,
-                    'temperature': temperature,
-                    'top_p': top_p,
-                    'sample_count': sample_count,
-                    'start_date': start_date if start_date else 'latest'
-                }
-            )
-        except Exception as e:
-            print(f"Failed to save prediction results: {e}")
-        
+        saved_path = save_prediction_results(
+            file_path=file_path,
+            prediction_type=prediction_type,
+            prediction_results=prediction_results,
+            actual_data=actual_data,
+            input_data=x_df,
+            prediction_params=prediction_params
+        )
+
         return jsonify({
             'success': True,
             'prediction_type': prediction_type,
             'chart': chart_json,
             'prediction_results': prediction_results,
             'actual_data': actual_data,
+            'historical_data': historical_data,
             'has_comparison': len(actual_data) > 0,
+            'window': {
+                'start_index': start,
+                'end_index': end,
+                'lookback': lookback,
+                'pred_len': pred_len,
+                'effective_context': min(lookback, getattr(predictor, 'max_context', lookback))
+            },
+            'params': prediction_params,
+            'saved_file': os.path.basename(saved_path) if saved_path else None,
             'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
         })
-        
+
     except Exception as e:
         return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+
+def current_model_info():
+    """Describe the currently loaded model, or None"""
+    if predictor is None or current_model_key not in AVAILABLE_MODELS:
+        return None
+    config = AVAILABLE_MODELS[current_model_key]
+    return {
+        'key': current_model_key,
+        'name': config['name'],
+        'params': config['params'],
+        'context_length': config['context_length'],
+        'description': config['description'],
+        'device': current_device
+    }
 
 @app.route('/api/load-model', methods=['POST'])
 def load_model():
     """Load Kronos model"""
-    global tokenizer, model, predictor
-    
+    global tokenizer, model, predictor, current_model_key, current_device
+
     try:
         if not MODEL_AVAILABLE:
             return jsonify({'error': 'Kronos model library not available'}), 400
-        
-        data = request.get_json()
+
+        data = request.get_json(silent=True) or {}
         model_key = data.get('model_key', 'kronos-small')
         device = data.get('device', 'cpu')
-        
+
         if model_key not in AVAILABLE_MODELS:
             return jsonify({'error': f'Unsupported model: {model_key}'}), 400
-        
+
+        known_devices = {d['id']: d for d in detect_devices()}
+        if device not in known_devices:
+            return jsonify({'error': f'Unsupported device: {device}'}), 400
+        if not known_devices[device]['available']:
+            return jsonify({'error': f'Device {device} is not available on this machine'}), 400
+
         model_config = AVAILABLE_MODELS[model_key]
-        
-        # Load tokenizer and model
-        tokenizer = KronosTokenizer.from_pretrained(model_config['tokenizer_id'])
-        model = Kronos.from_pretrained(model_config['model_id'])
-        
-        # Create predictor
-        predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
-        
+
+        # Load into locals first so a failed load leaves the previous model usable
+        new_tokenizer = KronosTokenizer.from_pretrained(model_config['tokenizer_id'])
+        new_model = Kronos.from_pretrained(model_config['model_id'])
+        new_predictor = KronosPredictor(new_model, new_tokenizer, device=device, max_context=model_config['context_length'])
+
+        tokenizer, model, predictor = new_tokenizer, new_model, new_predictor
+        current_model_key, current_device = model_key, device
+
         return jsonify({
             'success': True,
             'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {device}',
-            'model_info': {
-                'name': model_config['name'],
-                'params': model_config['params'],
-                'context_length': model_config['context_length'],
-                'description': model_config['description']
-            }
+            'model_info': current_model_info()
         })
-        
+
     except Exception as e:
         return jsonify({'error': f'Model loading failed: {str(e)}'}), 500
 
@@ -667,22 +675,22 @@ def get_available_models():
     """Get available model list"""
     return jsonify({
         'models': AVAILABLE_MODELS,
-        'model_available': MODEL_AVAILABLE
+        'model_available': MODEL_AVAILABLE,
+        'devices': detect_devices(),
+        'data_dirs': [os.path.relpath(d, PROJECT_ROOT) for d in DATA_DIRS]
     })
 
 @app.route('/api/model-status')
 def get_model_status():
     """Get model status"""
     if MODEL_AVAILABLE:
-        if predictor is not None:
+        info = current_model_info()
+        if info is not None:
             return jsonify({
                 'available': True,
                 'loaded': True,
                 'message': 'Kronos model loaded and available',
-                'current_model': {
-                    'name': predictor.model.__class__.__name__,
-                    'device': str(next(predictor.model.parameters()).device)
-                }
+                'current_model': info
             })
         else:
             return jsonify({
@@ -701,8 +709,8 @@ if __name__ == '__main__':
     print("Starting Kronos Web UI...")
     print(f"Model availability: {MODEL_AVAILABLE}")
     if MODEL_AVAILABLE:
-        print("Tip: You can load Kronos model through /api/load-model endpoint")
+        print("Tip: Load a Kronos model from the Model panel in the browser")
     else:
-        print("Tip: Will use simulated data for demonstration")
-    
+        print("Tip: Install the dependencies in requirements.txt to enable forecasting")
+
     app.run(debug=True, host='0.0.0.0', port=7070)
