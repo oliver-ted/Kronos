@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark">
-    <title>Kronos Forecast Workspace</title>
+    <title>Ascentia Forecast Workspace</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2310141b'/%3E%3Cpath d='M3 11 L6 7 L9 9 L13 4' fill='none' stroke='%23e3a63b' stroke-width='1.6'/%3E%3C/svg%3E">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/workspace.css') }}">
     <script src="{{ url_for('plotly_js') }}" defer></script>
@@ -13,7 +13,9 @@
 <body>
     <header class="topbar">
         <div class="brand">
-            <span class="brand-mark">Kronos</span>
+            <img class="brand-logo" src="{{ url_for('static', filename='img/aether-ai-logo-white.png') }}" alt="Aether AI" width="84" height="20">
+            <span class="brand-divider" aria-hidden="true"></span>
+            <span class="brand-mark">Ascentia</span>
             <span class="brand-sub">Forecast Workspace</span>
         </div>
         <dl class="status-strip">

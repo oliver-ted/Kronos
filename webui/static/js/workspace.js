@@ -1,4 +1,4 @@
-/* Kronos Forecast Workspace client */
+/* Ascentia Forecast Workspace client */
 (function () {
     'use strict';
 
@@ -55,7 +55,7 @@
         try {
             response = await fetch(path, options);
         } catch (err) {
-            throw new Error('Cannot reach the Kronos server. Check that webui/app.py is still running.');
+            throw new Error('Cannot reach the Ascentia server. Check that webui/app.py is still running.');
         }
         let payload = null;
         try {

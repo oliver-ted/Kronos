@@ -1,4 +1,4 @@
-/* Kronos Forecast Workspace */
+/* Ascentia Forecast Workspace */
 
 :root {
     --bg: #0a0d12;
@@ -89,12 +89,27 @@ ol, ul { padding: 0; list-style: none; }
 
 .brand {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: var(--s2);
     flex-shrink: 0;
     padding-right: var(--s4);
     border-right: 1px solid var(--border);
     height: 24px;
+}
+
+.brand-logo {
+    display: block;
+    height: 20px;
+    width: auto;
+    align-self: center;
+}
+
+.brand-divider {
+    align-self: center;
+    width: 1px;
+    height: 16px;
+    margin: 0 2px;
+    background: var(--border-strong);
 }
 
 .brand-mark {
